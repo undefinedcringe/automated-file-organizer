@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -38,6 +39,8 @@ DEFAULT_OUTPUT_NAME = "Organized"
 DUPLICATES_DIR = "_duplicates"
 NO_EXTENSION_DIR = "_no_extension"
 DEFAULT_LOG_DIR = Path(__file__).resolve().parent / "logs"
+JOURNAL_SUFFIX = ".journal.jsonl"
+JOURNAL_VERSION = 1
 
 EXIT_OK = 0
 EXIT_PARTIAL_FAILURE = 1
@@ -350,19 +353,119 @@ def _copy_verified(entry: FileEntry, destination: Path) -> None:
         raise
 
 
-def prepare_folder(output: Path, folder: Path) -> None:
-    """Create a destination folder, refusing symlinks below the output root."""
-    current = output
-    for part in folder.relative_to(output).parts:
+class MoveJournal:
+    """Durable, private record of a run, used by undo_organizer.py.
+
+    Each move is recorded before it happens, so a crash cannot leave a moved
+    file that undo does not know about.
+    """
+
+    def __init__(self, path: Path, source: Path, output: Path) -> None:
+        self.path = path
+        self._source = source
+        self._output = output
+        self._stream: io.TextIOWrapper | None = None
+
+    @property
+    def used(self) -> bool:
+        return self._stream is not None
+
+    def _write(self, record: dict[str, object]) -> None:
+        if self._stream is None:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            descriptor = os.open(self.path, flags, 0o600)
+            self._stream = os.fdopen(descriptor, "w", encoding="ascii")
+            self._write(
+                {
+                    "type": "header",
+                    "version": JOURNAL_VERSION,
+                    "source": str(self._source),
+                    "output": str(self._output),
+                }
+            )
+        # ASCII JSON escapes newlines and non-UTF-8 file names losslessly.
+        self._stream.write(json.dumps(record) + "\n")
+        self._stream.flush()
+        os.fsync(self._stream.fileno())
+
+    def record_folder(self, folder: Path) -> None:
+        self._write({"type": "folder", "path": str(folder)})
+
+    def begin(self, entry: FileEntry, destination: Path) -> None:
+        self._write(
+            {
+                "type": "move",
+                "source": str(entry.path),
+                "destination": str(destination),
+                "size": entry.size,
+                "mtime_ns": entry.mtime_ns,
+            }
+        )
+
+    def finish(self, destination: Path) -> None:
+        try:
+            info = destination.lstat()
+            self._write(
+                {
+                    "type": "done",
+                    "destination": str(destination),
+                    "size": info.st_size,
+                    "mtime_ns": info.st_mtime_ns,
+                }
+            )
+        except OSError as error:
+            logger.error("JOURNAL FAILED %r: %s", str(destination), error)
+
+    def abort(self, destination: Path) -> None:
+        try:
+            self._write({"type": "abort", "destination": str(destination)})
+        except OSError as error:
+            logger.error("JOURNAL FAILED %r: %s", str(destination), error)
+
+    def close(self) -> None:
+        if self._stream is not None:
+            with suppress(OSError):
+                self._stream.close()
+
+
+def reject_symlinks(root: Path, path: Path) -> None:
+    """Raise if any folder from root down to path is a symlink."""
+    current = root
+    for part in path.relative_to(root).parts:
         current /= part
         if current.is_symlink():
             raise UnsafePathError(f"Refusing symlinked folder: {str(current)!r}")
+
+
+def _missing_folders(folder: Path) -> list[Path]:
+    """Return folders that must be created, outermost first."""
+    missing: list[Path] = []
+    current = folder
+    while not os.path.lexists(current):
+        missing.append(current)
+        current = current.parent
+    return missing[::-1]
+
+
+def prepare_folder(
+    output: Path, folder: Path, journal: MoveJournal | None = None
+) -> None:
+    """Create a destination folder, refusing symlinks below the output root."""
+    reject_symlinks(output, folder)
     if not folder.is_dir():
+        if journal is not None:
+            for missing in _missing_folders(folder):
+                journal.record_folder(missing)
         folder.mkdir(parents=True, exist_ok=True)
         logger.info("APPLY CREATE FOLDER %r", str(folder))
 
 
-def execute_plan(config: Config, plan: Iterable[PlannedMove], summary: Summary) -> None:
+def execute_plan(
+    config: Config,
+    plan: Iterable[PlannedMove],
+    summary: Summary,
+    journal: MoveJournal | None = None,
+) -> None:
     prefix = "APPLY" if config.apply else "DRY-RUN"
     reserved: set[Path] = set()
 
@@ -371,8 +474,8 @@ def execute_plan(config: Config, plan: Iterable[PlannedMove], summary: Summary) 
         destination = unique_destination(move.folder, source.name, reserved)
         try:
             if config.apply:
-                prepare_folder(config.output, move.folder)
-                destination = _move_with_retry(move, destination, reserved)
+                prepare_folder(config.output, move.folder, journal)
+                destination = _move_with_retry(move, destination, reserved, journal)
         except (OSError, OrganizerError) as error:
             logger.error("FAILED %r: %s", str(source), error)
             summary.failed += 1
@@ -391,21 +494,37 @@ def execute_plan(config: Config, plan: Iterable[PlannedMove], summary: Summary) 
 
 
 def _move_with_retry(
-    move: PlannedMove, destination: Path, reserved: set[Path]
+    move: PlannedMove,
+    destination: Path,
+    reserved: set[Path],
+    journal: MoveJournal | None = None,
 ) -> Path:
     """Pick a new name if another process claims the destination first."""
     while True:
+        # A journal failure raises here, before the file is touched.
+        if journal is not None:
+            journal.begin(move.entry, destination)
         try:
             move_without_overwrite(move.entry, destination)
-            return destination
         except FileExistsError:
+            if journal is not None:
+                journal.abort(destination)
             reserved.add(destination)
             destination = unique_destination(
                 move.folder, move.entry.path.name, reserved
             )
+        except (OSError, OrganizerError):
+            # If the source vanished, the destination may be the last copy.
+            if journal is not None and os.path.lexists(move.entry.path):
+                journal.abort(destination)
+            raise
+        else:
+            if journal is not None:
+                journal.finish(destination)
+            return destination
 
 
-def organize(config: Config) -> Summary:
+def organize(config: Config, journal: MoveJournal | None = None) -> Summary:
     """Scan, plan, and either preview or apply the file moves."""
     summary = Summary()
     files = list(
@@ -419,7 +538,7 @@ def organize(config: Config) -> Summary:
     )
     summary.scanned = len(files)
     logger.info("Scanned %d file(s) in %r", summary.scanned, str(config.source))
-    execute_plan(config, build_plan(config, files, summary), summary)
+    execute_plan(config, build_plan(config, files, summary), summary, journal)
     return summary
 
 
@@ -504,6 +623,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: cannot create log file in {log_dir}: {error}", file=sys.stderr)
         return EXIT_INVALID_USAGE
 
+    journal: MoveJournal | None = None
     try:
         output = args.output or args.source.expanduser() / DEFAULT_OUTPUT_NAME
         source, output = validate_paths(args.source, output)
@@ -520,7 +640,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info("Mode: %s", "APPLY" if config.apply else "DRY-RUN (no changes)")
         logger.info("Source: %r | Output: %r", str(source), str(output))
 
-        summary = organize(config)
+        if config.apply:
+            journal_path = log_path.with_name(log_path.stem + JOURNAL_SUFFIX)
+            journal = MoveJournal(journal_path, source, output)
+        summary = organize(config, journal)
 
         logger.info(
             "Summary: scanned=%d moved=%d duplicates=%d skipped=%d failed=%d",
@@ -530,6 +653,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not config.apply:
             logger.info("Preview only. Re-run with --apply to move files.")
         logger.info("Log saved to %r", str(log_path))
+        if journal is not None and journal.used:
+            logger.info("To reverse this run: python3 undo_organizer.py")
         return EXIT_PARTIAL_FAILURE if summary.failed else EXIT_OK
     except UnsafePathError as error:
         logger.error("%s", error)
@@ -538,6 +663,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.warning("Interrupted. Files already moved remain in place.")
         return EXIT_INTERRUPTED
     finally:
+        if journal is not None:
+            journal.close()
         close_logging()
 
 

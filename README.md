@@ -10,6 +10,7 @@ It previews by default, and it never deletes or overwrites your files.
 - **Creates folders automatically**, only when a file needs them.
 - **Detects duplicates** by comparing SHA-256 hashes, including against files organized in earlier runs. The oldest copy is kept in place and the others move to `Organized/_duplicates/` for review.
 - **Logs everything** to the console and to a private, timestamped log file.
+- **Undoes runs** by restoring files to their original paths and removing the empty folders the run created.
 
 ## Demo
 
@@ -53,6 +54,32 @@ python3 file_organizer.py ~/Downloads --apply
 
 Exit codes are `0` for success, `1` if some files failed, `2` for invalid or unsafe paths, and `130` if interrupted.
 
+## Undo a run
+
+Every `--apply` run saves a private journal in `logs/`. Preview undoing the latest run:
+
+```bash
+python3 undo_organizer.py
+```
+
+Restore the files:
+
+```bash
+python3 undo_organizer.py --apply
+```
+
+Run it again to step back through earlier runs. To see every run, or undo a specific one:
+
+```bash
+python3 undo_organizer.py --list
+```
+
+```bash
+python3 undo_organizer.py logs/organizer_YYYYMMDD_HHMMSS_ffffff.journal.jsonl --apply
+```
+
+Undo never overwrites a file. If a new file now occupies the original path, or a file was edited after organizing, it stays where it is and the run reports it with exit code `1`. Keep the `logs/` folder if you want to be able to undo.
+
 ## Safety features
 
 - Moves cannot overwrite: the destination is claimed atomically, and name clashes become `name (1).ext`.
@@ -61,7 +88,9 @@ Exit codes are `0` for success, `1` if some files failed, `2` for invalid or uns
 - Symlinks, pipes, and devices are never followed or moved.
 - System folders, home directories, hidden config folders such as `~/.ssh`, and Git, Mercurial, or Subversion repositories are protected.
 - File names are escaped in logs, so a crafted name cannot forge log entries or inject terminal codes.
-- Log files are readable only by your user.
+- Log files and undo journals are readable only by your user.
+- Each move is journaled before it happens, so runs can be undone even after a crash.
+- Undo rejects journals that are corrupt, writable by others, symlinked, or point outside the original folders.
 
 ## Technologies used
 
@@ -83,7 +112,7 @@ Exit codes are `0` for success, `1` if some files failed, `2` for invalid or uns
 python3 -m unittest -v
 ```
 
-The suite has 40 tests and 87% branch coverage. It covers sorting, duplicates, the command line, hostile file names, simulated race conditions, and a randomized check that all file contents survive a run. A real move between two filesystems was also verified by hand.
+The suite has 70 tests and 88% branch coverage. It covers sorting, duplicates, undo, the command line, hostile file names, tampered journals, simulated race conditions, and a randomized check that all file contents survive a run. Undo was also verified on 1,200 generated files across real filesystems and after `kill -9` crashes at several points in a run.
 
 ## Problems encountered and solved
 
@@ -102,6 +131,9 @@ The suite has 40 tests and 87% branch coverage. It covers sorting, duplicates, t
 | Non-UTF-8 consoles caused logging errors | Noisy, unreliable output | Escape unsupported characters |
 | Piping into `head` produced thousands of error lines | Unusable output | Stop console output quietly and keep the file log |
 | pytest was not installed | Tests could not run | Use the built-in `unittest` and stay dependency-free |
+| A crash could happen after a move but before it was recorded | Moved file unknown to undo | Write and sync each journal entry before moving |
+| A crash between linking and unlinking left one file at two paths | False conflict during undo | Detect the shared inode and remove only the extra link |
+| A journal is a list of file moves, so it could be tampered with | Undo used to move arbitrary files | Validate ownership, permissions, and every path before moving anything |
 
 ## Known limitations
 
@@ -109,3 +141,5 @@ The suite has 40 tests and 87% branch coverage. It covers sorting, duplicates, t
 - Emptied subfolders are left in place, because the tool never deletes anything.
 - Files are grouped by their last extension, so `backup.tar.gz` goes to `gz/`.
 - A copy moved between drives by a different user may not keep the original owner.
+- Syncing the journal for crash safety slows very large runs, to roughly 70 files per second on the test machine.
+- If a crash interrupts a copy between drives, a partial file can remain in the output folder. The original stays safe, and undo reports the partial file instead of removing it.

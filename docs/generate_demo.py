@@ -17,7 +17,7 @@ from pathlib import Path
 
 DOCS = Path(__file__).resolve().parent
 SCRIPT = DOCS.parent / "file_organizer.py"
-WIDTH = 1640
+WIDTH = 1800
 LINE_HEIGHT = 22
 SAMPLES = {
     "invoice.pdf": "invoice-2026",

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Tool caches and reports
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Runtime output (logs contain file names from your computer)
+logs/
+test-tmp/

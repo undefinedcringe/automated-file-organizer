@@ -143,3 +143,7 @@ The suite has 70 tests and 88% branch coverage. It covers sorting, duplicates, u
 - A copy moved between drives by a different user may not keep the original owner.
 - Syncing the journal for crash safety slows very large runs, to roughly 70 files per second on the test machine.
 - If a crash interrupts a copy between drives, a partial file can remain in the output folder. The original stays safe, and undo reports the partial file instead of removing it.
+
+## License
+
+Released into the public domain under [The Unlicense](LICENSE). You can use it for any purpose, with no attribution required. It comes with no warranty.
